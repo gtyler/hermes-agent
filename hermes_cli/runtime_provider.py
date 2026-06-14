@@ -494,10 +494,11 @@ def _resolve_entry_key_env(entry: Dict[str, Any]) -> str:
     reference, reading ``os.environ`` *at request time*.
 
     Accepts the canonical ``key_env`` plus the documented snake_case
-    ``api_key_env`` alias and the camelCase ``apiKeyEnv`` spelling, mirroring
-    :func:`hermes_cli.config._normalize_custom_provider_entry`. ``key_env``
-    wins when more than one form is present. Returns ``""`` when no env-var
-    name is configured or the named variable is unset/blank.
+    ``api_key_env`` alias and the camelCase ``keyEnv`` / ``apiKeyEnv``
+    spellings, mirroring the alias map in
+    :func:`hermes_cli.config._normalize_custom_provider_entry` (canonical
+    snake_case keys win). Returns ``""`` when no env-var name is configured or
+    the named variable is unset/blank.
 
     This closes the gap behind GH #44666 (``api_key_env`` ignored on a
     ``providers:`` dict entry) and GH #43586 (``key_env``/``api_key_env`` on a
@@ -505,7 +506,7 @@ def _resolve_entry_key_env(entry: Dict[str, Any]) -> str:
     read only the literal ``api_key`` and fell through to ``no-key-required``.
     """
     env_name = ""
-    for field in ("key_env", "api_key_env", "apiKeyEnv"):
+    for field in ("key_env", "api_key_env", "keyEnv", "apiKeyEnv"):
         candidate = str(entry.get(field, "") or "").strip()
         if candidate:
             env_name = candidate

@@ -900,6 +900,42 @@ def test_named_custom_provider_uses_api_key_env_alias_from_providers_dict(monkey
     assert resolved["api_key"] == "litellm-secret"
 
 
+def test_named_custom_provider_uses_camelcase_keyenv_from_providers_dict(monkeypatch):
+    """GH #44666 (follow-up): the raw providers: dict bypasses the config
+    normalizer's camelCase alias map, which maps both `keyEnv` and `apiKeyEnv`
+    to `key_env`. Runtime resolution must honor the camelCase `keyEnv` spelling
+    too, otherwise it falls through to `no-key-required`."""
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    monkeypatch.setenv("LITELLM_API_KEY", "litellm-secret")
+    monkeypatch.setattr(
+        rp,
+        "load_config",
+        lambda: {
+            "providers": {
+                "litellm": {
+                    "base_url": "http://127.0.0.1:4000/v1",
+                    "keyEnv": "LITELLM_API_KEY",
+                }
+            }
+        },
+    )
+    monkeypatch.setattr(
+        rp,
+        "resolve_provider",
+        lambda *a, **k: (_ for _ in ()).throw(
+            AssertionError(
+                "resolve_provider should not be called for named custom providers"
+            )
+        ),
+    )
+
+    resolved = rp.resolve_runtime_provider(requested="custom:litellm")
+
+    assert resolved["provider"] == "custom"
+    assert resolved["api_key"] == "litellm-secret"
+
+
 def test_bare_custom_model_resolves_key_env_from_config(monkeypatch):
     """GH #43586: a bare `model: { provider: custom, base_url, key_env }`
     block (no custom_providers/providers entry) must resolve its key_env from

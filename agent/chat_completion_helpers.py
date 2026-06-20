@@ -653,6 +653,7 @@ def build_api_kwargs(agent, api_messages: list) -> dict:
             is_github_responses=is_github_responses,
             is_codex_backend=is_codex_backend,
             is_xai_responses=is_xai_responses,
+            is_custom_provider=agent.provider == "custom",  # AGT-101
             github_reasoning_extra=agent._github_models_reasoning_extra_body() if is_github_responses else None,
             replay_encrypted_reasoning=bool(
                 getattr(agent, "_codex_reasoning_replay_enabled", True)
@@ -754,6 +755,7 @@ def build_api_kwargs(agent, api_messages: list) -> dict:
             request_overrides=agent.request_overrides,
             session_id=getattr(agent, "session_id", None),
             provider_profile=_profile,
+            is_custom_provider=agent.provider == "custom",  # AGT-101
             ollama_num_ctx=agent._ollama_num_ctx,
             # Context forwarded to profile hooks:
             provider_preferences=_prefs or None,

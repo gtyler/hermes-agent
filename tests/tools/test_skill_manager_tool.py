@@ -957,3 +957,392 @@ class TestPinnedGuard:
                        side_effect=RuntimeError("sidecar broken")):
                 result = _delete_skill("my-skill")
         assert result["success"] is True
+
+
+# ---------------------------------------------------------------------------
+# Operator-locked policy regions (AGT-123)
+#
+# The self-patcher must never rewrite, drop, reorder, or forge operator-authored
+# policy wrapped in <!-- operator-locked -->...<!-- /operator-locked -->. It may
+# still edit freely OUTSIDE the markers. Modeled on the AGT-122 incident: a live
+# self-patch silently reversed the positions-optimize --wait-seconds rule.
+# ---------------------------------------------------------------------------
+
+from tools.skill_manager_tool import (  # noqa: E402
+    _locked_region_violation,
+    _extract_locked_regions,
+    _count_lock_markers,
+    _skill_dir_locked_files,
+    OPERATOR_LOCK_OPEN,
+    OPERATOR_LOCK_CLOSE,
+)
+
+
+# A SKILL.md whose execution policy is operator-locked (the real wait-seconds
+# rule) with a free-to-edit calibration section below it.
+LOCKED_SKILL_CONTENT = """\
+---
+name: positions-optimize
+description: Optimize open positions safely.
+---
+
+# Positions Optimize
+
+## Execution policy
+
+<!-- operator-locked -->
+- Keep the executor's `--wait-seconds` at 30.
+- Treat `--wait-seconds 120` as cron-unsafe (AGT-118).
+<!-- /operator-locked -->
+
+## Calibration notes
+
+(none yet)
+"""
+
+# The exact reversal the live agent performed in AGT-122.
+REVERSED_LOCK = (
+    "- `--wait-seconds 120` has been observed to work fine.\n"
+    "- Only use `--wait-seconds 30` if you hit actual terminal timeouts."
+)
+
+
+def _make_locked_skill(content: str = LOCKED_SKILL_CONTENT) -> None:
+    """Create the positions-optimize skill with locked content for a test."""
+    res = _create_skill("positions-optimize", content)
+    assert res["success"] is True, res
+
+
+def _author_locked_file(skill_dir: Path, rel_path: str, body: str) -> Path:
+    """Write a locked supporting file straight to disk, simulating an operator
+    authoring it out-of-band (git / dashboard). The self-patch tool itself
+    refuses to MINT lock markers, so tests can't use _write_file to set this up.
+    """
+    target = skill_dir / rel_path
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(body, encoding="utf-8")
+    return target
+
+
+class TestLockedRegionViolation:
+    """Unit tests for the _locked_region_violation invariant checker."""
+
+    def test_no_locks_anywhere_allowed(self):
+        assert _locked_region_violation("plain body", "plain body edited") is None
+
+    def test_edit_outside_lock_allowed(self):
+        updated = LOCKED_SKILL_CONTENT.replace("(none yet)", "- Run 489: 120s took 95s.")
+        assert _locked_region_violation(LOCKED_SKILL_CONTENT, updated) is None
+
+    def test_modifying_locked_text_refused(self):
+        updated = LOCKED_SKILL_CONTENT.replace(
+            "- Treat `--wait-seconds 120` as cron-unsafe (AGT-118).", REVERSED_LOCK
+        )
+        err = _locked_region_violation(LOCKED_SKILL_CONTENT, updated)
+        assert err is not None
+        assert "operator-locked" in err
+        assert "AGT-123" in err
+
+    def test_dropping_locked_region_refused(self):
+        # Remove the whole locked block (markers + content).
+        region = _extract_locked_regions(LOCKED_SKILL_CONTENT)[0]
+        updated = LOCKED_SKILL_CONTENT.replace(region, "- 120 is fine now.")
+        assert _locked_region_violation(LOCKED_SKILL_CONTENT, updated) is not None
+
+    def test_stripping_open_marker_refused(self):
+        updated = LOCKED_SKILL_CONTENT.replace(OPERATOR_LOCK_OPEN + "\n", "")
+        assert _locked_region_violation(LOCKED_SKILL_CONTENT, updated) is not None
+
+    def test_stripping_close_marker_refused(self):
+        updated = LOCKED_SKILL_CONTENT.replace("\n" + OPERATOR_LOCK_CLOSE, "")
+        assert _locked_region_violation(LOCKED_SKILL_CONTENT, updated) is not None
+
+    def test_whitespace_change_inside_lock_refused(self):
+        # Even a trivial reflow inside the region is refused — policy is byte-exact.
+        updated = LOCKED_SKILL_CONTENT.replace(
+            "- Keep the executor's `--wait-seconds` at 30.",
+            "-  Keep the executor's `--wait-seconds` at 30.",
+        )
+        assert _locked_region_violation(LOCKED_SKILL_CONTENT, updated) is not None
+
+    def test_forging_new_lock_on_unlocked_original_refused(self):
+        original = "---\nname: x\ndescription: y\n---\n\nBody.\n"
+        updated = original + f"\n{OPERATOR_LOCK_OPEN}\n- my own rule\n{OPERATOR_LOCK_CLOSE}\n"
+        err = _locked_region_violation(original, updated)
+        assert err is not None
+        assert "may only be" in err
+
+    def test_adding_second_lock_while_preserving_first_refused(self):
+        updated = LOCKED_SKILL_CONTENT + (
+            f"\n{OPERATOR_LOCK_OPEN}\n- forged extra rule\n{OPERATOR_LOCK_CLOSE}\n"
+        )
+        assert _locked_region_violation(LOCKED_SKILL_CONTENT, updated) is not None
+
+    def test_reordering_two_locks_refused(self):
+        two = (
+            f"{OPERATOR_LOCK_OPEN}\nA\n{OPERATOR_LOCK_CLOSE}\n"
+            f"{OPERATOR_LOCK_OPEN}\nB\n{OPERATOR_LOCK_CLOSE}\n"
+        )
+        swapped = (
+            f"{OPERATOR_LOCK_OPEN}\nB\n{OPERATOR_LOCK_CLOSE}\n"
+            f"{OPERATOR_LOCK_OPEN}\nA\n{OPERATOR_LOCK_CLOSE}\n"
+        )
+        assert _locked_region_violation(two, swapped) is not None
+
+    def test_label_is_included_in_error(self):
+        updated = LOCKED_SKILL_CONTENT.replace("at 30.", "at 120.")
+        err = _locked_region_violation(LOCKED_SKILL_CONTENT, updated, label="references/policy.md")
+        assert "references/policy.md" in err
+
+    def test_labeled_marker_variant_is_protected(self):
+        # Operators may annotate the open marker with a reason/ticket.
+        labeled = (
+            "<!-- operator-locked: AGT-118 keep wait-seconds 30 -->\n"
+            "- Keep --wait-seconds at 30.\n"
+            "<!-- /operator-locked -->\n"
+        )
+        assert _extract_locked_regions(labeled), "labeled marker should be recognized"
+        reversed_ = labeled.replace("- Keep --wait-seconds at 30.", "- 120 is fine.")
+        assert _locked_region_violation(labeled, reversed_) is not None
+
+    def test_count_lock_markers(self):
+        assert _count_lock_markers(LOCKED_SKILL_CONTENT) == (1, 1)
+        assert _count_lock_markers("no markers") == (0, 0)
+
+
+class TestOperatorLockEdit:
+    """_edit_skill refuses full rewrites that touch a locked region."""
+
+    def test_edit_reversing_locked_rule_refused(self, tmp_path):
+        with _skill_dir(tmp_path):
+            _make_locked_skill()
+            reversed_content = LOCKED_SKILL_CONTENT.replace(
+                "- Treat `--wait-seconds 120` as cron-unsafe (AGT-118).", REVERSED_LOCK
+            )
+            result = _edit_skill("positions-optimize", reversed_content)
+            on_disk = (tmp_path / "positions-optimize" / "SKILL.md").read_text()
+        assert result["success"] is False
+        assert "operator-locked" in result["error"]
+        # File must be untouched — the original rule still stands, reversal absent.
+        assert "Treat `--wait-seconds 120` as cron-unsafe (AGT-118)." in on_disk
+        assert "has been observed to work fine" not in on_disk
+
+    def test_edit_outside_lock_allowed(self, tmp_path):
+        with _skill_dir(tmp_path):
+            _make_locked_skill()
+            updated = LOCKED_SKILL_CONTENT.replace(
+                "(none yet)", "- Run 491: 120s completed, but cron killed it once."
+            )
+            result = _edit_skill("positions-optimize", updated)
+            on_disk = (tmp_path / "positions-optimize" / "SKILL.md").read_text()
+        assert result["success"] is True, result
+        assert "Run 491" in on_disk
+        assert "cron-unsafe (AGT-118)" in on_disk  # lock intact
+
+    def test_edit_forging_lock_on_unlocked_skill_refused(self, tmp_path):
+        with _skill_dir(tmp_path):
+            _create_skill("my-skill", VALID_SKILL_CONTENT)
+            forged = VALID_SKILL_CONTENT + (
+                f"\n{OPERATOR_LOCK_OPEN}\n- my own rule\n{OPERATOR_LOCK_CLOSE}\n"
+            )
+            result = _edit_skill("my-skill", forged)
+        assert result["success"] is False
+        assert "may only be" in result["error"]
+
+
+class TestOperatorLockPatch:
+    """_patch_skill refuses find/replace whose result touches a locked region."""
+
+    def test_patch_reversing_locked_rule_refused(self, tmp_path):
+        with _skill_dir(tmp_path):
+            _make_locked_skill()
+            result = _patch_skill(
+                "positions-optimize",
+                "- Treat `--wait-seconds 120` as cron-unsafe (AGT-118).",
+                "- `--wait-seconds 120` works fine; only use 30 on terminal timeouts.",
+            )
+            on_disk = (tmp_path / "positions-optimize" / "SKILL.md").read_text()
+        assert result["success"] is False
+        assert "operator-locked" in result["error"]
+        assert "cron-unsafe (AGT-118)" in on_disk  # unchanged
+
+    def test_patch_appending_calibration_note_allowed(self, tmp_path):
+        with _skill_dir(tmp_path):
+            _make_locked_skill()
+            result = _patch_skill(
+                "positions-optimize", "(none yet)", "- Run 495: 120s ok in manual run."
+            )
+            on_disk = (tmp_path / "positions-optimize" / "SKILL.md").read_text()
+        assert result["success"] is True, result
+        assert "Run 495" in on_disk
+        assert "cron-unsafe (AGT-118)" in on_disk  # lock intact
+
+    def test_patch_replace_all_touching_lock_refused(self, tmp_path):
+        with _skill_dir(tmp_path):
+            _make_locked_skill()
+            # `--wait-seconds` occurs inside the locked region; replace_all would
+            # rewrite locked text.
+            result = _patch_skill(
+                "positions-optimize", "`--wait-seconds`", "`--delay`", replace_all=True
+            )
+            on_disk = (tmp_path / "positions-optimize" / "SKILL.md").read_text()
+        assert result["success"] is False
+        assert "operator-locked" in result["error"]
+        assert "`--delay`" not in on_disk
+
+    def test_patch_supporting_file_lock_refused(self, tmp_path):
+        with _skill_dir(tmp_path):
+            _create_skill("my-skill", VALID_SKILL_CONTENT)
+            _author_locked_file(
+                tmp_path / "my-skill",
+                "references/policy.md",
+                f"# Policy\n\n{OPERATOR_LOCK_OPEN}\n- never trim more than 5%\n{OPERATOR_LOCK_CLOSE}\n",
+            )
+            result = _patch_skill(
+                "my-skill",
+                "- never trim more than 5%",
+                "- trimming 50% is fine",
+                file_path="references/policy.md",
+            )
+            on_disk = (tmp_path / "my-skill" / "references" / "policy.md").read_text()
+        assert result["success"] is False
+        assert "references/policy.md" in result["error"]
+        assert "never trim more than 5%" in on_disk
+
+
+class TestOperatorLockWriteRemoveFile:
+    """write_file/remove_file cannot be used to bypass the lock."""
+
+    def test_write_file_overwriting_skill_md_lock_refused(self, tmp_path):
+        with _skill_dir(tmp_path):
+            _make_locked_skill()
+            reversed_content = LOCKED_SKILL_CONTENT.replace(
+                "- Treat `--wait-seconds 120` as cron-unsafe (AGT-118).", REVERSED_LOCK
+            )
+            result = _write_file("positions-optimize", "SKILL.md", reversed_content)
+            on_disk = (tmp_path / "positions-optimize" / "SKILL.md").read_text()
+        assert result["success"] is False
+        assert "operator-locked" in result["error"]
+        assert "cron-unsafe (AGT-118)" in on_disk
+
+    def test_write_file_forging_lock_in_new_file_refused(self, tmp_path):
+        with _skill_dir(tmp_path):
+            _create_skill("my-skill", VALID_SKILL_CONTENT)
+            result = _write_file(
+                "my-skill",
+                "references/policy.md",
+                f"{OPERATOR_LOCK_OPEN}\n- forged\n{OPERATOR_LOCK_CLOSE}\n",
+            )
+        assert result["success"] is False
+        assert "may only be" in result["error"]
+        assert not (tmp_path / "my-skill" / "references" / "policy.md").exists()
+
+    def test_write_file_editing_outside_supporting_lock_allowed(self, tmp_path):
+        locked_ref = f"# Policy\n\n{OPERATOR_LOCK_OPEN}\n- cap trim at 5%\n{OPERATOR_LOCK_CLOSE}\n\nNotes: old\n"
+        with _skill_dir(tmp_path):
+            _create_skill("my-skill", VALID_SKILL_CONTENT)
+            _author_locked_file(tmp_path / "my-skill", "references/policy.md", locked_ref)
+            updated = locked_ref.replace("Notes: old", "Notes: updated 2026-06-21")
+            result = _write_file("my-skill", "references/policy.md", updated)
+            on_disk = (tmp_path / "my-skill" / "references" / "policy.md").read_text()
+        assert result["success"] is True, result
+        assert "Notes: updated" in on_disk
+        assert "cap trim at 5%" in on_disk
+
+    def test_remove_file_with_lock_refused(self, tmp_path):
+        with _skill_dir(tmp_path):
+            _create_skill("my-skill", VALID_SKILL_CONTENT)
+            _author_locked_file(
+                tmp_path / "my-skill",
+                "references/policy.md",
+                f"{OPERATOR_LOCK_OPEN}\n- cap trim at 5%\n{OPERATOR_LOCK_CLOSE}\n",
+            )
+            result = _remove_file("my-skill", "references/policy.md")
+        assert result["success"] is False
+        assert "operator-locked" in result["error"]
+        assert (tmp_path / "my-skill" / "references" / "policy.md").exists()
+
+    def test_remove_unlocked_file_still_works(self, tmp_path):
+        with _skill_dir(tmp_path):
+            _create_skill("my-skill", VALID_SKILL_CONTENT)
+            _write_file("my-skill", "references/notes.md", "just notes")
+            result = _remove_file("my-skill", "references/notes.md")
+        assert result["success"] is True, result
+        assert not (tmp_path / "my-skill" / "references" / "notes.md").exists()
+
+
+class TestOperatorLockDelete:
+    """_delete_skill refuses to drop a skill that carries locked policy."""
+
+    def test_delete_skill_with_locked_skill_md_refused(self, tmp_path):
+        with _skill_dir(tmp_path):
+            _make_locked_skill()
+            result = _delete_skill("positions-optimize", absorbed_into="")
+        assert result["success"] is False
+        assert "operator-locked" in result["error"]
+        assert "SKILL.md" in result["error"]
+        assert (tmp_path / "positions-optimize" / "SKILL.md").exists()
+
+    def test_delete_skill_with_lock_only_in_supporting_file_refused(self, tmp_path):
+        with _skill_dir(tmp_path):
+            _create_skill("my-skill", VALID_SKILL_CONTENT)  # clean SKILL.md
+            _author_locked_file(
+                tmp_path / "my-skill",
+                "references/policy.md",
+                f"{OPERATOR_LOCK_OPEN}\n- cap trim at 5%\n{OPERATOR_LOCK_CLOSE}\n",
+            )
+            result = _delete_skill("my-skill", absorbed_into="")
+        assert result["success"] is False
+        assert "references/policy.md" in result["error"]
+        assert (tmp_path / "my-skill").exists()
+
+    def test_delete_unlocked_skill_still_works(self, tmp_path):
+        with _skill_dir(tmp_path):
+            _create_skill("my-skill", VALID_SKILL_CONTENT)
+            result = _delete_skill("my-skill", absorbed_into="")
+        assert result["success"] is True, result
+        assert not (tmp_path / "my-skill").exists()
+
+    def test_skill_dir_locked_files_lists_all_locked(self, tmp_path):
+        with _skill_dir(tmp_path):
+            _make_locked_skill()
+            _author_locked_file(
+                tmp_path / "positions-optimize",
+                "references/policy.md",
+                f"{OPERATOR_LOCK_OPEN}\n- x\n{OPERATOR_LOCK_CLOSE}\n",
+            )
+            skill_dir = tmp_path / "positions-optimize"
+            locked = _skill_dir_locked_files(skill_dir)
+        assert "SKILL.md" in locked
+        assert "references/policy.md" in locked
+
+
+class TestOperatorLockDispatcher:
+    """End-to-end through skill_manage() — the agent-facing entry point."""
+
+    def test_patch_reversal_blocked_via_dispatcher(self, tmp_path):
+        with _skill_dir(tmp_path):
+            skill_manage(action="create", name="positions-optimize", content=LOCKED_SKILL_CONTENT)
+            raw = skill_manage(
+                action="patch",
+                name="positions-optimize",
+                old_string="- Treat `--wait-seconds 120` as cron-unsafe (AGT-118).",
+                new_string="- 120 is fine.",
+            )
+            on_disk = (tmp_path / "positions-optimize" / "SKILL.md").read_text()
+        result = json.loads(raw)
+        assert result["success"] is False
+        assert "operator-locked" in result["error"]
+        assert "cron-unsafe (AGT-118)" in on_disk
+
+    def test_calibration_append_allowed_via_dispatcher(self, tmp_path):
+        with _skill_dir(tmp_path):
+            skill_manage(action="create", name="positions-optimize", content=LOCKED_SKILL_CONTENT)
+            raw = skill_manage(
+                action="patch",
+                name="positions-optimize",
+                old_string="(none yet)",
+                new_string="- Run 489 logged.",
+            )
+        result = json.loads(raw)
+        assert result["success"] is True, result

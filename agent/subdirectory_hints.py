@@ -144,7 +144,12 @@ class SubdirectoryHintTracker:
                 if parent == p:
                     break  # filesystem root
                 p = parent
-        except (OSError, ValueError):
+        except (OSError, ValueError, RuntimeError):
+            # RuntimeError("Could not determine home directory.") is raised by
+            # Path.expanduser() for a ``~user`` token whose user is not in the
+            # password database (e.g. the agent emits a shell command containing
+            # ``~unknownuser/...``).  Such a token is not a real workspace path,
+            # so skip it rather than letting it abort the whole agent turn.
             pass
 
     def _extract_paths_from_command(self, cmd: str, candidates: Set[Path]):

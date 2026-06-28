@@ -291,6 +291,60 @@ class TestPermissionErrorHandling:
             assert result is None or isinstance(result, str)
 
 
+class TestExpanduserRuntimeErrorHandling:
+    """Regression tests for RuntimeError from Path.expanduser() (ref AGT-20 / upstream #29433).
+
+    ``Path.expanduser()`` raises ``RuntimeError("Could not determine home
+    directory.")`` for a ``~user`` token whose user is not in the password
+    database.  Because the agent shlex-splits every tool-call command and
+    expands every path-like token, an emitted command containing
+    ``~unknownuser/...`` would otherwise propagate the RuntimeError up through
+    check_tool_call and abort the entire agent turn.
+    """
+
+    def test_add_path_candidate_survives_expanduser_runtimeerror(self, project):
+        """_add_path_candidate must swallow RuntimeError from expanduser()."""
+        tracker = SubdirectoryHintTracker(working_dir=str(project))
+        candidates = set()
+        with patch.object(
+            Path, "expanduser",
+            side_effect=RuntimeError("Could not determine home directory."),
+        ):
+            # Must not raise; an unresolvable token yields no candidates.
+            tracker._add_path_candidate("~unknownuser/foo/bar.py", candidates)
+        assert candidates == set()
+
+    def test_unresolvable_tilde_user_token_does_not_abort(self, project):
+        """A real ``~nonexistentuser`` token in a terminal command is skipped, not fatal.
+
+        Uses an actual unresolvable user so the genuine RuntimeError path in
+        Path.expanduser() is exercised end-to-end (no mocking).
+        """
+        tracker = SubdirectoryHintTracker(working_dir=str(project))
+        # Should return None (no hints) rather than raising RuntimeError.
+        result = tracker.check_tool_call(
+            "terminal",
+            {"command": "cat ~nonexistentuser12345/positions/state.json"},
+        )
+        assert result is None
+
+    def test_valid_paths_still_loaded_alongside_bad_tilde_token(self, project):
+        """A bad ~user token must not block hint discovery for a valid sibling path."""
+        tracker = SubdirectoryHintTracker(working_dir=str(project))
+        result = tracker.check_tool_call(
+            "terminal",
+            {
+                "command": (
+                    f"cp ~nobodyuser98765/x.txt "
+                    f"{project / 'frontend' / 'index.ts'}"
+                )
+            },
+        )
+        # The valid frontend path is still discovered despite the bad token.
+        assert result is not None
+        assert "Frontend rules" in result
+
+
 class TestOutsideWorkspaceRejection:
     """Direct tests for _is_valid_subdir rejecting outside-workspace paths."""
 
